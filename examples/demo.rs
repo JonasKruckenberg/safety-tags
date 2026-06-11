@@ -67,7 +67,7 @@ pub unsafe fn read_first(base: *const u8) -> u8 {
     // #[safety::checked] attribute is consumed before rustc sees it.
     #[safety::checked(
         Init = "every byte of `u8` is a valid, initialized value",
-        delegate(ValidPtr)
+        delegate(ValidPtr = "ensured by the caller")
     )]
     unsafe {
         read(base)

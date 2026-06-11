@@ -31,16 +31,16 @@
 //!   a leftover `#[safety::checked]` is a hard error on stable, never a
 //!   silent no-op.
 //!
-//! - `#[safety::checked(TagA = "why it holds here", delegate(TagB))]` on an
-//!   `unsafe { f(x) }` block, a direct call, or a `let` statement (inside a
-//!   `requires`/`checks` fn):
+//! - `#[safety::checked(TagA = "why it holds here", delegate(TagB = "why
+//!   forwarding it is sound"))]` on an `unsafe { f(x) }` block, a direct
+//!   call, or a `let` statement (inside a `requires`/`checks` fn):
 //!   * derives the hidden name from the union of discharged + delegated
 //!     tag names and rewrites the call to it (wrong/missing tags simply
 //!     fail name resolution at compile time),
-//!   * requires a reason string per discharged tag — the per-call-site
-//!     safety comment — and embeds all reasons into the expansion as
-//!     `const _: &[(&str, &str)]` so they remain machine-readable for
-//!     tooling (delegated tags may optionally carry a reason),
+//!   * requires a reason string per tag, discharged *and* delegated — the
+//!     per-call-site safety comment — and embeds all reasons into the
+//!     expansion as `const _: &[(&str, &str)]` so they remain
+//!     machine-readable for tooling,
 //!   * emits `let _ = __safety_delegates_<Tag>;` for each delegated tag,
 //!     which only compiles inside a function carrying
 //!     `#[safety::requires(Tag = "...")]`.
@@ -148,14 +148,15 @@ impl Parse for CheckedArgs {
                 if kw != "delegate" {
                     return Err(syn::Error::new(
                         kw.span(),
-                        "expected `Tag = \"reason\"` or `delegate(Tag, ...)`",
+                        "expected `Tag = \"reason\"` or `delegate(Tag = \"reason\", ...)`",
                     ));
                 }
                 let content;
                 syn::parenthesized!(content in input);
-                delegated.extend(Punctuated::<TagSpec, Token![,]>::parse_terminated(
-                    &content,
-                )?);
+                for spec in Punctuated::<TagSpec, Token![,]>::parse_terminated(&content)? {
+                    spec.require_reason("why passing this obligation to our own callers is sound")?;
+                    delegated.push(spec);
+                }
             } else {
                 let spec: TagSpec = input.parse()?;
                 spec.require_reason("why this invariant holds at this call site")?;
@@ -276,7 +277,7 @@ fn expand_checked(attr: Attribute, expr: &mut Expr) -> syn::Result<()> {
     // them back out of the expansion.
     let justifications: Vec<proc_macro2::TokenStream> = discharged
         .iter()
-        .chain(delegated.iter().filter(|s| s.reason.is_some()))
+        .chain(delegated.iter())
         .map(|s| {
             let name = s.name.to_string();
             let reason = s.reason.as_ref().map(|r| r.value()).unwrap_or_default();
