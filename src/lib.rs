@@ -14,10 +14,16 @@
 //!     tag into the real body (this is what makes `delegate(...)` resolve
 //!     only inside functions that themselves require the tag),
 //!   * re-emits the original name as an `#[inline(always)]` wrapper that
-//!     calls one *undefined* extern symbol per tag and then forwards.
-//!     Because the wrapper is `#[inline(always)]`, it is only codegen'd if
-//!     someone actually calls the public (unchecked) name — at which point
-//!     the final link fails with the poison symbols in the error message,
+//!     trips a post-monomorphization const-eval panic and then forwards.
+//!     The panic lives in an associated const behind a generic parameter,
+//!     so it is only evaluated when the wrapper is instantiated — and the
+//!     wrapper, being `#[inline(always)]`, is only instantiated if someone
+//!     actually calls the public (unchecked) name. A clean program never
+//!     evaluates it; an unchecked call fails `cargo build` of the crate
+//!     containing the call (no final link needed), with an error message
+//!     listing every required tag and its reason. (A plain
+//!     `compile_error!()` cannot work here: it fires unconditionally at
+//!     macro expansion time, long before anyone knows the call sites.)
 //!   * appends an auto-generated `# Safety` rustdoc section listing every
 //!     tag and its reason (this also satisfies
 //!     `clippy::missing_safety_doc`),
@@ -406,6 +412,18 @@ pub fn requires(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+fn func_type_params(f: &ItemFn) -> Vec<&Ident> {
+    f.sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Type(t) => Some(&t.ident),
+            _ => None,
+        })
+        .collect()
+}
+
 fn expand_requires(specs: Vec<TagSpec>, mut func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     if func.sig.unsafety.is_none() {
         return Err(syn::Error::new_spanned(
@@ -474,23 +492,19 @@ fn expand_requires(specs: Vec<TagSpec>, mut func: ItemFn) -> syn::Result<proc_ma
         quote!(::<#(#generic_args),*>)
     };
 
-    // --- poison symbols: one undefined extern fn per required tag ----------
-    // These are *references only*; nothing ever defines them, so name
-    // collisions across crates/modules are benign (diagnostics merge).
-    let krate = std::env::var("CARGO_PKG_NAME")
-        .unwrap_or_default()
-        .replace(['-', '.'], "_");
-    let poison_syms: Vec<Ident> = tags
-        .iter()
-        .map(|t| {
-            format_ident!(
-                "SAFETY_VIOLATION__in_crate_{}__unchecked_call_to_{}__requires_tag_{}",
-                krate,
-                public_name,
-                t
-            )
-        })
-        .collect();
+    // --- violation message for the post-mono const-eval panic --------------
+    let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let mut violation_msg = format!(
+        "SAFETY VIOLATION: unchecked call to `{krate}::{public_name}`. \
+Discharge every tag with #[safety::checked(..)]:"
+    );
+    for spec in &specs {
+        violation_msg.push_str(&format!(
+            " [{}: {}]",
+            spec.name,
+            spec.reason.as_ref().map(|r| r.value()).unwrap_or_default()
+        ));
+    }
 
     // --- hidden entry point: assoc fn on a same-named empty enum ------------
     // The empty enum occupies only the type namespace, so it coexists with
@@ -523,12 +537,24 @@ fn expand_requires(specs: Vec<TagSpec>, mut func: ItemFn) -> syn::Result<proc_ma
 
         impl #public_name {
             #hidden_fn
+
+            /// Fallback tripwire for non-generic functions: the const is
+            /// polymorphic over `__Safety`, and this helper is only
+            /// *instantiated* (rustc's lazy boundary is generic-fn
+            /// instantiation, not const lookup) when the wrapper is
+            /// codegen'd — i.e. iff an unchecked call exists.
+            #[doc(hidden)]
+            pub fn __safety_violation<__Safety: ?Sized>() {
+                struct __Poison<__Safety: ?Sized>(::core::marker::PhantomData<__Safety>);
+                impl<__Safety: ?Sized> __Poison<__Safety> {
+                    const TRIPPED: () = panic!(#violation_msg);
+                }
+                let _ = __Poison::<__Safety>::TRIPPED;
+            }
         }
     };
 
-    // --- public wrapper: poison + forward -----------------------------------
-    // NOTE: `unsafe extern` requires Rust >= 1.82 (and is mandatory on
-    // edition 2024). On older toolchains, drop the `unsafe` keyword.
+    // --- public wrapper: tripwire + forward ----------------------------------
     let mut wrapper = func;
     // Auto-generated safety docs from the tag reasons. Appending after the
     // user's own docs; also satisfies clippy::missing_safety_doc.
@@ -545,13 +571,33 @@ fn expand_requires(specs: Vec<TagSpec>, mut func: ItemFn) -> syn::Result<proc_ma
         );
         wrapper.attrs.push(parse_quote!(#[doc = #line]));
     }
+    // Tripwire selection. Rule learned the hard way: a const that is
+    // MONOMORPHIC in its enclosing fn is evaluated eagerly when the
+    // *defining* crate compiles, even if the fn is never instantiated; only
+    // generic-dependent consts (and generic fn instantiation) are lazy.
+    //  - Generic fn: embed the const directly in the wrapper, parameterized
+    //    by the fn's own type params. Innermost instantiation above the
+    //    error is then `f::<Args>` itself, so rustc's "while instantiating"
+    //    note points at the offending CALL SITE.
+    //  - Non-generic fn: call the per-fn generic helper on the namespace
+    //    enum. Dormant for the same reason; the note points at the callee,
+    //    but the panic message still names crate, fn, tags, and reasons.
+    let type_params: Vec<&Ident> = func_type_params(&wrapper);
+    let tripwire: proc_macro2::TokenStream = if type_params.is_empty() {
+        quote!( #public_name::__safety_violation::<()>(); )
+    } else {
+        quote!(
+            struct __Poison<__Safety: ?Sized>(::core::marker::PhantomData<__Safety>);
+            impl<__Safety: ?Sized> __Poison<__Safety> {
+                const TRIPPED: () = panic!(#violation_msg);
+            }
+            let _ = __Poison::<( #(#type_params,)* )>::TRIPPED;
+        )
+    };
     wrapper.attrs.push(parse_quote!(#[allow(unused_unsafe)]));
-    wrapper.attrs.push(parse_quote!(#[inline(always)])); // critical: codegen only if actually called
+    wrapper.attrs.push(parse_quote!(#[inline(always)])); // critical: instantiated only if actually called
     wrapper.block = Box::new(parse_quote!({
-        unsafe extern "C" {
-            #( fn #poison_syms(); )*
-        }
-        unsafe { #( #poison_syms(); )* }
+        #tripwire
         unsafe { #public_name::#hidden_name #turbofish ( #(#fwd_args),* ) }
     }));
 
